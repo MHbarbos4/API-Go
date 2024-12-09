@@ -1,13 +1,15 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
+
 	"github.com/gorilla/mux"
 	_ "go-api/docs" // Import gerado automaticamente pelo swag
 	httpSwagger "github.com/swaggo/http-swagger"
-	"log"
 )
 
 // Estrutura para o item
@@ -16,9 +18,6 @@ type Item struct {
 	Name  string  `json:"name"`
 	Price float64 `json:"price"`
 }
-
-var items []Item
-var nextID int = 1
 
 // Handlers
 
@@ -29,6 +28,23 @@ var nextID int = 1
 // @Success 200 {array} Item
 // @Router /items [get]
 func getItems(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query("SELECT id, name, price FROM items")
+	if err != nil {
+		http.Error(w, "Error fetching items", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var items []Item
+	for rows.Next() {
+		var item Item
+		if err := rows.Scan(&item.ID, &item.Name, &item.Price); err != nil {
+			http.Error(w, "Error reading items", http.StatusInternalServerError)
+			return
+		}
+		items = append(items, item)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(items)
 }
@@ -43,7 +59,6 @@ func getItems(w http.ResponseWriter, r *http.Request) {
 // @Failure 404 {string} string "Item not found"
 // @Router /items/{id} [get]
 func getItemByID(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 	params := mux.Vars(r)
 	id, err := strconv.Atoi(params["id"])
 	if err != nil {
@@ -51,18 +66,22 @@ func getItemByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for _, item := range items {
-		if item.ID == id {
-			json.NewEncoder(w).Encode(item)
-			return
-		}
+	var item Item
+	err = db.QueryRow("SELECT id, name, price FROM items WHERE id = ?", id).Scan(&item.ID, &item.Name, &item.Price)
+	if err == sql.ErrNoRows {
+		http.Error(w, "Item not found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, "Error fetching item", http.StatusInternalServerError)
+		return
 	}
 
-	http.Error(w, "Item not found", http.StatusNotFound)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(item)
 }
 
 // @Summary Create an item
-// @Description Add a new item to the list
+// @Description Add a new item to the database
 // @Tags items
 // @Accept json
 // @Produce json
@@ -70,14 +89,22 @@ func getItemByID(w http.ResponseWriter, r *http.Request) {
 // @Success 201 {object} Item
 // @Router /items [post]
 func createItem(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 	var newItem Item
-	json.NewDecoder(r.Body).Decode(&newItem)
+	if err := json.NewDecoder(r.Body).Decode(&newItem); err != nil {
+		http.Error(w, "Invalid input", http.StatusBadRequest)
+		return
+	}
 
-	newItem.ID = nextID
-	nextID++
+	result, err := db.Exec("INSERT INTO items (name, price) VALUES (?, ?)", newItem.Name, newItem.Price)
+	if err != nil {
+		http.Error(w, "Error inserting item", http.StatusInternalServerError)
+		return
+	}
 
-	items = append(items, newItem)
+	id, _ := result.LastInsertId()
+	newItem.ID = int(id)
+
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(newItem)
 }
@@ -94,7 +121,6 @@ func createItem(w http.ResponseWriter, r *http.Request) {
 // @Failure 404 {string} string "Item not found"
 // @Router /items/{id} [put]
 func updateItem(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 	params := mux.Vars(r)
 	id, err := strconv.Atoi(params["id"])
 	if err != nil {
@@ -103,17 +129,26 @@ func updateItem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var updatedItem Item
-	json.NewDecoder(r.Body).Decode(&updatedItem)
-	for i, item := range items {
-		if item.ID == id {
-			updatedItem.ID = item.ID
-			items[i] = updatedItem
-			json.NewEncoder(w).Encode(updatedItem)
-			return
-		}
+	if err := json.NewDecoder(r.Body).Decode(&updatedItem); err != nil {
+		http.Error(w, "Invalid input", http.StatusBadRequest)
+		return
 	}
 
-	http.Error(w, "Item not found", http.StatusNotFound)
+	result, err := db.Exec("UPDATE items SET name = ?, price = ? WHERE id = ?", updatedItem.Name, updatedItem.Price, id)
+	if err != nil {
+		http.Error(w, "Error updating item", http.StatusInternalServerError)
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		http.Error(w, "Item not found", http.StatusNotFound)
+		return
+	}
+
+	updatedItem.ID = id
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(updatedItem)
 }
 
 // @Summary Delete an item
@@ -125,7 +160,6 @@ func updateItem(w http.ResponseWriter, r *http.Request) {
 // @Failure 404 {string} string "Item not found"
 // @Router /items/{id} [delete]
 func deleteItem(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 	params := mux.Vars(r)
 	id, err := strconv.Atoi(params["id"])
 	if err != nil {
@@ -133,23 +167,31 @@ func deleteItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for i, item := range items {
-		if item.ID == id {
-			items = append(items[:i], items[i+1:]...)
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
+	result, err := db.Exec("DELETE FROM items WHERE id = ?", id)
+	if err != nil {
+		http.Error(w, "Error deleting item", http.StatusInternalServerError)
+		return
 	}
 
-	http.Error(w, "Item not found", http.StatusNotFound)
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		http.Error(w, "Item not found", http.StatusNotFound)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // @title Item API
 // @version 1.0
-// @description This is a simple API for managing items.
+// @description This is a simple API for managing items using SQLite.
 // @host localhost:8080
 // @BasePath /
 func main() {
+	// Inicializar banco de dados
+	initDB()
+	defer db.Close()
+
 	r := mux.NewRouter()
 
 	// Swagger
